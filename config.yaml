@@ -1,3 +1,8 @@
+market:
+  provider: okx
+  symbol_map:
+    btcusdt: BTC-USDT-SWAP
+
 # Runtime-safe defaults (single symbol first, then scale out)
 symbols:
   - btcusdt

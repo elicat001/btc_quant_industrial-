@@ -227,6 +227,14 @@ class MidTrend:
         self._trading = (config.get("trading") or {})
         self._symbol_map = (self._trading.get("symbol_map") or {}).copy()
         self._session = requests.Session() if requests else None
+        self._market = (config.get("market") or {})
+        self._provider = str(self._market.get("provider", "binance")).lower()
+        self._http_451_count = 0
+        self._max_451_before_disable = int((config.get("midtrend") or {}).get("max_451_before_disable", 3))
+
+        if self._provider != "binance":
+            self.enabled = False
+            logger.info(f"[midtrend] provider={self._provider}，自动禁用 midtrend（当前仅支持 binance REST）")
 
         # 最近错误节流
         self._last_err_ts = 0.0
@@ -260,6 +268,12 @@ class MidTrend:
         try:
             r = self._session.get(url, params=params, timeout=self.cfg.http_timeout)
             if r.status_code != 200:
+                if r.status_code == 451:
+                    self._http_451_count += 1
+                    if self._http_451_count >= self._max_451_before_disable:
+                        self.enabled = False
+                        logger.error("[midtrend] 连续触发 HTTP 451，已自动禁用 midtrend，避免日志风暴")
+                        return None
                 if time.time() - self._last_err_ts > self._err_cool_s:
                     logger.error(f"[midtrend] HTTP {r.status_code}: {r.text}")
                     self._last_err_ts = time.time()

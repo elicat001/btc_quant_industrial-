@@ -518,7 +518,7 @@ class SymbolRunner:
 
     def __init__(self, symbol: str):
         self.symbol = symbol.lower()
-        self.collector = BinanceCollector(self.symbol)
+        self.collector = BinanceCollector(self.symbol, config=CONFIG)
         self.fb = FeatureBuilder(seq_len=SEQ_LEN)
         self.mm = ModelManager(self.symbol)
         self.sf = SignalFusion()

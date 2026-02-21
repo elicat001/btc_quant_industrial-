@@ -201,42 +201,62 @@ class OrderBookState:
 
 class BinanceCollector:
     """
-    双通道冗余采集（aggTrade / depth20@100ms），秒级无缝重连。
-    兼容旧接口：提供 stream() -> (trade, depth) 生成器。
-    新增：
-      - self.ob_state: OrderBookState，用于维护 top-k + 价差变化 + LC统计
-      - get_orderbook_ctx(): 供主循环直接取盘口上下文
+    多交易所采集器（兼容原 BinanceCollector 名称）
+    provider: binance | okx
+    - 对外接口保持不变：stream()/get_orderbook_ctx()
     """
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, config: dict | None = None):
         self.symbol = symbol.lower()
-        self.aggtrade_uri = f"{BINANCE_WS_PRIMARY}/{self.symbol}@aggTrade"
-        self.depth_uri    = f"{BINANCE_WS_PRIMARY}/{self.symbol}@depth20@100ms"
+        self.config = config or {}
 
-        self._queue = asyncio.Queue()   # 合并后的数据队列
-        self._cache = deque(maxlen=500) # 近500条缓存（新连接可快速回补）
+        market_cfg = (self.config.get("market") or {})
+        self.provider = str(market_cfg.get("provider", "binance")).lower()
+
+        # 交易对映射：market.symbol_map > trading.symbol_map
+        m_map = (market_cfg.get("symbol_map") or {})
+        t_map = ((self.config.get("trading") or {}).get("symbol_map") or {})
+        self.symbol_map = {**t_map, **m_map}
+
+        # OKX 默认把 btcusdt -> BTC-USDT-SWAP
+        self.inst_id = self._resolve_symbol(self.symbol)
+
+        self.aggtrade_uri = f"{BINANCE_WS_PRIMARY}/{self.symbol}@aggTrade"
+        self.depth_uri = f"{BINANCE_WS_PRIMARY}/{self.symbol}@depth20@100ms"
+        self.okx_uri = os.getenv("OKX_WS_PUBLIC", "wss://ws.okx.com:8443/ws/v5/public")
+
+        self._queue = asyncio.Queue()
+        self._cache = deque(maxlen=500)
         self._reconnect_delay = 1
         self._max_reconnect_delay = int(os.getenv("WS_MAX_RECONNECT_DELAY", "60"))
 
-        # 盘口状态（给 signal.fuse 用）
         self.ob_state = OrderBookState(k_levels=3, dt_window_ms=300)
 
-    async def start(self):
-        """后台启动两个独立连接协程。"""
-        await asyncio.gather(
-            self._connect(self.aggtrade_uri, "aggTrade"),
-            self._connect(self.depth_uri, "depth20")
-        )
+    def _resolve_symbol(self, sym: str) -> str:
+        if sym in self.symbol_map:
+            return str(self.symbol_map[sym])
+        if sym.lower() in self.symbol_map:
+            return str(self.symbol_map[sym.lower()])
+        if self.provider == "okx":
+            base = sym.lower().replace("usdt", "").upper()
+            return f"{base}-USDT-SWAP"
+        return sym.lower()
 
-    async def _connect(self, uri: str, channel_name: str):
-        """单通道循环连接并推送数据到队列。"""
+    async def start(self):
+        if self.provider == "okx":
+            await asyncio.gather(
+                self._connect_okx("trades"),
+                self._connect_okx("books5")
+            )
+        else:
+            await asyncio.gather(
+                self._connect_binance(self.aggtrade_uri, "aggTrade"),
+                self._connect_binance(self.depth_uri, "depth20")
+            )
+
+    async def _connect_binance(self, uri: str, channel_name: str):
         while True:
             try:
-                async with websockets.connect(
-                    uri,
-                    ping_interval=PING_INTERVAL,
-                    ping_timeout=PING_TIMEOUT,
-                    max_queue=None
-                ) as ws:
+                async with websockets.connect(uri, ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT, max_queue=None) as ws:
                     logger.info(f"[{self.symbol}] {channel_name} WebSocket连接成功: {uri}")
                     self._reconnect_delay = 1
                     async for msg in ws:
@@ -244,39 +264,84 @@ class BinanceCollector:
                             data = json.loads(msg)
                             data["channel"] = channel_name
                             data["recv_ts"] = datetime.utcnow().isoformat()
-
-                            # 如果是 depth20，顺手更新订单簿状态（提取 bids/asks）
                             if channel_name == "depth20":
-                                # binance depth payload 字段通常为 "b": [[price,qty],...], "a": [[price,qty],...]
                                 bids = data.get("b") or data.get("bids") or []
                                 asks = data.get("a") or data.get("asks") or []
                                 self.ob_state.on_depth_update(bids, asks)
-
                             await self._queue.put(data)
                             self._cache.append(data)
                         except Exception as e:
                             logger.error(f"[{self.symbol}] {channel_name} 消息处理异常: {e}")
                             traceback.print_exc()
             except Exception as e:
-                msg = str(e)
-                # 区域限制/风控拦截时，采用指数退避，避免日志风暴
-                if "451" in msg or "restricted location" in msg.lower():
-                    self._reconnect_delay = min(max(5, self._reconnect_delay * 2), self._max_reconnect_delay)
-                else:
-                    self._reconnect_delay = min(max(1, self._reconnect_delay + 1), self._max_reconnect_delay)
+                self._apply_backoff(e)
                 logger.warning(f"[{self.symbol}] {channel_name} WebSocket断开: {e}，将在{self._reconnect_delay}s后重连")
                 await asyncio.sleep(self._reconnect_delay)
 
+    async def _connect_okx(self, channel: str):
+        while True:
+            try:
+                async with websockets.connect(self.okx_uri, ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT, max_queue=None) as ws:
+                    sub = {"op": "subscribe", "args": [{"channel": channel, "instId": self.inst_id}]}
+                    await ws.send(json.dumps(sub))
+                    logger.info(f"[{self.symbol}] OKX {channel} 订阅成功: {self.inst_id}")
+                    self._reconnect_delay = 1
+
+                    async for msg in ws:
+                        try:
+                            j = json.loads(msg)
+                            if isinstance(j, dict) and j.get("event") in ("subscribe", "pong"):
+                                continue
+                            if "data" not in j:
+                                continue
+                            rows = j.get("data") or []
+                            if not rows:
+                                continue
+
+                            if channel == "trades":
+                                row = rows[0]
+                                data = {
+                                    "channel": "aggTrade",
+                                    "recv_ts": datetime.utcnow().isoformat(),
+                                    "p": str(row.get("px", "0")),
+                                    "q": str(row.get("sz", "0")),
+                                    "T": int(row.get("ts", 0) or 0),
+                                }
+                                await self._queue.put(data)
+                                self._cache.append(data)
+                            else:  # books5
+                                row = rows[0]
+                                bids = row.get("bids") or []
+                                asks = row.get("asks") or []
+                                # 标准化为 Binance 风格键，兼容下游
+                                data = {
+                                    "channel": "depth20",
+                                    "recv_ts": datetime.utcnow().isoformat(),
+                                    "b": [[b[0], b[1]] for b in bids],
+                                    "a": [[a[0], a[1]] for a in asks],
+                                }
+                                self.ob_state.on_depth_update(data["b"], data["a"])
+                                await self._queue.put(data)
+                                self._cache.append(data)
+                        except Exception as e:
+                            logger.error(f"[{self.symbol}] okx-{channel} 消息处理异常: {e}")
+            except Exception as e:
+                self._apply_backoff(e)
+                logger.warning(f"[{self.symbol}] okx-{channel} 断开: {e}，将在{self._reconnect_delay}s后重连")
+                await asyncio.sleep(self._reconnect_delay)
+
+    def _apply_backoff(self, e: Exception):
+        msg = str(e)
+        if "451" in msg or "restricted location" in msg.lower():
+            self._reconnect_delay = min(max(5, self._reconnect_delay * 2), self._max_reconnect_delay)
+        else:
+            self._reconnect_delay = min(max(1, self._reconnect_delay + 1), self._max_reconnect_delay)
+
     async def get_data(self):
-        """低层合并数据流（逐条消息）。"""
         while True:
             yield await self._queue.get()
 
     async def stream(self):
-        """
-        兼容旧式接口：每次产出 (trade_dict_or_None, depth_dict_or_None)。
-        注意：两路消息异步到达——调用方应只在trade到来时做特征，depth用于补充快照。
-        """
         while True:
             trade_data = None
             depth_data = None
@@ -291,14 +356,5 @@ class BinanceCollector:
     def get_recent_cache(self):
         return list(self._cache)
 
-    # === 新增：给主循环/策略使用的盘口上下文 ===
     def get_orderbook_ctx(self):
-        """
-        返回：book_snapshot, last_quote_change_ms, d_spread_dt_bp, now_ts_ms
-        - book_snapshot: {"bid":[{"price":..,"size":..},...], "ask":[...], "imb":.., "spread_bp":.., "stats":{...}}
-          仅前 k 档；imb>0 偏卖，<0 偏买
-        - last_quote_change_ms: 最优价最近一次变化的时间戳（ms）
-        - d_spread_dt_bp: 近 300ms 价差变化（bps）
-        - now_ts_ms: 当前毫秒时间戳
-        """
         return self.ob_state.get_orderbook_ctx()
