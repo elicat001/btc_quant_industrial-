@@ -76,6 +76,8 @@ class SignalFusion:
         fusion_atr = (cfg.get("fusion", {}) or {}).get("atr", {}) or {}
         self.atr_floor = float(fusion_atr.get("floor", 5e-6))
         self.atr_ceil  = float(fusion_atr.get("ceil", 7.5e-3))
+        self.pmin_low_vol_floor = float((cfg.get("strategy", {}) or {}).get("pmin_low_vol_floor", 0.54))
+        self.pmin_cap = float((cfg.get("strategy", {}) or {}).get("pmin_cap", 0.62))
 
         mm_user = (cfg.get("mm", {}) or {})
         # shallow keys
@@ -508,12 +510,15 @@ class SignalFusion:
         sl_mult = float(self.risk_params.get("sl_mult", 2.0))
         tp_min = float(self.risk_params.get("tp_min", 0.003))
         sl_min = float(self.risk_params.get("sl_min", 0.003))
-        p_min = self._p_min(atr_pct_est, fee, tp_mult, sl_mult, tp_min, sl_min)
+        p_min_raw = self._p_min(atr_pct_est, fee, tp_mult, sl_mult, tp_min, sl_min)
+        p_min = min(float(p_min_raw), float(self.pmin_cap))
+        if atr_pct_est < self.low_vol_bp:
+            p_min = min(p_min, float(self.pmin_low_vol_floor))
         self.p_min = float(p_min)
 
         regime = str(ctx.get("regime", "n/a"))
         diag = [
-            f"p={p:.3f}", f"p_min={p_min:.3f}", f"atr%={atr_pct_est:.3f}",
+            f"p={p:.3f}", f"p_min={p_min:.3f}", f"p_min_raw={p_min_raw:.3f}", f"atr%={atr_pct_est:.3f}",
             f"macd={macd:.3f}", f"rsi={rsi:.1f}", f"vol={vol_abs:.4f}",
             f"regime={regime}"
         ]
@@ -522,6 +527,7 @@ class SignalFusion:
         book_snapshot = ctx.get("book_snapshot")
         mm_enable = bool(self.mm_cfg.get("enable", True))
         mm_active = mm_enable and (book_snapshot is not None)
+        mm_score_last = 0.0
         diag.append(f"mm_ctx={'ON' if mm_active else 'OFF'}")
 
         # 逆动量 boost（只影响门槛）
@@ -564,7 +570,7 @@ class SignalFusion:
                 pass
 
             if opp.get("active", False):
-                mm_score = float(opp["score"])
+                mm_score = float(opp["score"]); mm_score_last = mm_score
                 mm_side = str(opp["side"])
                 cfg = self.mm_cfg
                 mm_ok = mm_score >= float(cfg["score_open"])
@@ -603,7 +609,8 @@ class SignalFusion:
                 elif gate_mode == "hybrid":
                     dir_ok = (basic_dir_ok and mm_ok) or force_ok
                 elif gate_mode == "relaxed":
-                    dir_ok = mm_ok and prob_ok
+                    # 低波环境下给做市盘口强分一个快速通道，避免长期全HOLD
+                    dir_ok = mm_ok and (prob_ok or (mm_score >= float(cfg["score_force"]) * 0.9))
                 elif gate_mode == "force":
                     dir_ok = force_ok
                 else:
@@ -619,9 +626,9 @@ class SignalFusion:
                     if not force_ok:    block_reasons.append("force")
                 elif gate_mode == "basic" and not basic_dir_ok:
                     block_reasons.append("basic_dir")
-                elif gate_mode == "relaxed" and not (mm_ok and prob_ok):
+                elif gate_mode == "relaxed" and not (mm_ok and (prob_ok or (mm_score >= float(cfg["score_force"]) * 0.9))):
                     if not mm_ok:    block_reasons.append("mm_ok")
-                    if not prob_ok:  block_reasons.append("prob")
+                    if not prob_ok and mm_score < float(cfg["score_force"]) * 0.9:  block_reasons.append("prob")
                 elif gate_mode == "force" and not force_ok:
                     block_reasons.append("force")
                 if block_reasons:
@@ -646,11 +653,12 @@ class SignalFusion:
         if low_vol:
             strong_prob = max(p - p_min, (1.0 - p) - p_min) >= self.low_vol_override_margin
             trend_evidence = (abs(macd) >= self.low_vol_macd_gate) or (rsi <= self.low_vol_rsi_lo) or (rsi >= self.low_vol_rsi_hi)
-            if not (strong_prob and trend_evidence):
+            mm_fastlane = mm_score_last >= float(self.mm_cfg.get("score_force", 0.55)) * 0.9
+            if not ((strong_prob and trend_evidence) or mm_fastlane):
                 phase_evt = self._phase_detect(feats_seq, book_snapshot, p, p_min, int(ctx.get("now_ts_ms", time.time()*1000)), ctx.get("closes"))
                 return "HOLD", " | ".join(diag + [f"low_vol<{self.low_vol_bp:.4f} HOLD"]), phase_evt
             else:
-                diag.append(f"low_vol_override (Δp={max(p - p_min, (1.0 - p) - p_min):.3f})")
+                diag.append(f"low_vol_override (Δp={max(p - p_min, (1.0 - p) - p_min):.3f},mm_fastlane={mm_fastlane})")
 
         # ===== 常规 gating =====
         if buy_gate_basic:

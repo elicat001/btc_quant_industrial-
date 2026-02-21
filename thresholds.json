@@ -12,15 +12,15 @@
     "b": 0.0
   },
   "runtime_thresholds": {
-    "buy": 0.56,
-    "sell": 0.44
+    "buy": 0.53,
+    "sell": 0.47
   },
   "risk": {
-    "fee_bp": 0.0005,
+    "fee_bp": 0.0002,
     "tp_mult": 1.8,
     "sl_mult": 1.6,
-    "tp_min": 0.002,
-    "sl_min": 0.002,
+    "tp_min": 0.0026,
+    "sl_min": 0.0018,
     "future_holding": 45
   }
 }
