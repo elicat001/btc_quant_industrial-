@@ -1,16 +1,20 @@
 import asyncio
-import websockets
 import json
+import os
+from collections import deque
+from datetime import datetime, timezone
+
+import joblib
 import numpy as np
 import torch
 import torch.optim as optim
-from collections import deque
-from datetime import datetime, timezone
-from sklearn.preprocessing import StandardScaler
-import joblib
-import os
+import websockets
 import yaml
-from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
+
+from model_definitions import EnhancedNBeats, EnhancedTFT
+from modules.features import FeatureBuilder
 
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f) or {}
@@ -18,12 +22,11 @@ with open("config.yaml", "r") as f:
 market = (config.get("market") or {})
 provider = str(market.get("provider", "okx")).lower()
 symbol = config.get("symbol", "BTCUSDT")
-input_size = int(config.get("input_size", 7))
+seq_len = int(config.get("seq_len", 30))
+input_size = int(config.get("input_size", 12))
 batch_size = int(config.get("batch_size", 32))
-save_interval = int(config.get("save_interval", 500))
+save_interval = int(config.get("save_interval", 50))
 future_shift = int(config.get("future_shift", 5))
-
-from model_definitions import EnhancedTFT, EnhancedNBeats
 
 
 def resolve_symbol_for_provider(sym: str):
@@ -40,20 +43,18 @@ def resolve_symbol_for_provider(sym: str):
 
 symbol_resolved = resolve_symbol_for_provider(str(symbol))
 
-# === 初始化模型 ===
+# models
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tft_model = EnhancedTFT(input_size=input_size).to(device)
 nbeats_model = EnhancedNBeats(input_size=input_size).to(device)
 criterion = torch.nn.MSELoss()
 tft_optimizer = optim.Adam(tft_model.parameters(), lr=1e-4)
 nbeats_optimizer = optim.Adam(nbeats_model.parameters(), lr=1e-4)
-tft_scheduler = optim.lr_scheduler.ReduceLROnPlateau(tft_optimizer, "min", factor=0.1, patience=10)
-nbeats_scheduler = optim.lr_scheduler.ReduceLROnPlateau(nbeats_optimizer, "min", factor=0.1, patience=10)
 
-price_window = deque(maxlen=500)
-order_book = {"bids": {}, "asks": {}}
-features_buffer = []
-labels_buffer = []
+# shared state
+latest_depth_evt = None
+trade_queue = asyncio.Queue(maxsize=5000)
+feature_builder = FeatureBuilder(seq_len=seq_len, k_levels=3)
 scaler_path = "scaler.pkl"
 scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 if scaler is not None:
@@ -63,78 +64,42 @@ if scaler is not None:
         scaler = None
 
 
-def extract_features(prices, ob):
-    if len(prices) < 20 or not ob["bids"] or not ob["asks"]:
-        return None
-    prices = np.array(prices, dtype=np.float32)
-    best_bid = max(ob["bids"].keys())
-    best_ask = min(ob["asks"].keys())
-    spread = float(best_ask - best_bid)
-    bid_depth = float(sum(ob["bids"].values()))
-    ask_depth = float(sum(ob["asks"].values()))
-    imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-6)
-
-    f = [
-        float(prices[-1]),
-        float(np.mean(prices[-5:])),
-        float(np.std(prices[-5:])),
-        float(prices[-1] - prices[-5]),
-        float((prices[-1] - np.mean(prices[-20:])) / (np.std(prices[-20:]) + 1e-6)),
-        spread,
-        float(imbalance),
-        float(np.mean(prices[-20:])),
-        float(np.std(prices[-20:])),
-        float(prices[-1] - prices[-20]),
-        float(spread / max(prices[-1], 1e-6)),
-        float(np.log1p(bid_depth + ask_depth)),
-    ]
-    if len(f) < input_size:
-        f.extend([0.0] * (input_size - len(f)))
-    elif len(f) > input_size:
-        f = f[:input_size]
-    return np.array(f, dtype=np.float32)
+# buffers
+seq_buffer = []  # list[(seq_np[T,F], price)]
+X_buffer = []
+y_buffer = []
 
 
-def train_batch(features, labels):
-    dataset = TensorDataset(torch.tensor(features, dtype=torch.float32).to(device), torch.tensor(labels, dtype=torch.float32).to(device))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    tft_loss_avg = 0
-    nbeats_loss_avg = 0
-    count = 0
-    for x_batch, y_batch in loader:
+def train_batch(seqs, labels):
+    x = torch.tensor(seqs, dtype=torch.float32).to(device)      # (B,T,F)
+    y = torch.tensor(labels, dtype=torch.float32).to(device)    # (B,)
+    ds = TensorDataset(x, y)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    tft_loss_avg = 0.0
+    nbeats_loss_avg = 0.0
+    n = 0
+    for xb, yb in dl:
+        # TFT uses full sequence
         tft_optimizer.zero_grad()
-        tft_pred = tft_model(x_batch.unsqueeze(1))
-        tft_loss = criterion(tft_pred.squeeze(), y_batch)
+        tft_pred = tft_model(xb).squeeze(-1)
+        tft_loss = criterion(tft_pred, yb)
         tft_loss.backward()
         tft_optimizer.step()
-        tft_loss_avg += tft_loss.item()
 
+        # NBeats keeps inference semantics: mean pooling over time
         nbeats_optimizer.zero_grad()
-        nbeats_pred = nbeats_model(x_batch)
-        nbeats_loss = criterion(nbeats_pred.squeeze(), y_batch)
+        x_pool = xb.mean(dim=1)
+        nbeats_pred = nbeats_model(x_pool).squeeze(-1)
+        nbeats_loss = criterion(nbeats_pred, yb)
         nbeats_loss.backward()
         nbeats_optimizer.step()
-        nbeats_loss_avg += nbeats_loss.item()
-        count += 1
-    return tft_loss_avg / max(1, count), nbeats_loss_avg / max(1, count)
 
+        tft_loss_avg += float(tft_loss.item())
+        nbeats_loss_avg += float(nbeats_loss.item())
+        n += 1
 
-async def trade_handler_binance():
-    url = f"wss://fstream.binance.com/ws/{symbol_resolved}@aggTrade"
-    async with websockets.connect(url, ping_interval=20) as ws:
-        async for msg in ws:
-            trade_data = json.loads(msg)
-            price = float(trade_data["p"])
-            price_window.append(price)
-
-
-async def depth_handler_binance():
-    url = f"wss://fstream.binance.com/ws/{symbol_resolved}@depth20@100ms"
-    async with websockets.connect(url, ping_interval=20) as ws:
-        async for msg in ws:
-            depth_data = json.loads(msg)
-            order_book["bids"] = {float(b[0]): float(b[1]) for b in depth_data.get("b", [])}
-            order_book["asks"] = {float(a[0]): float(a[1]) for a in depth_data.get("a", [])}
+    return tft_loss_avg / max(1, n), nbeats_loss_avg / max(1, n)
 
 
 async def trade_handler_okx():
@@ -148,10 +113,12 @@ async def trade_handler_okx():
             row = (j.get("data") or [None])[0]
             if not row:
                 continue
-            price_window.append(float(row.get("px", 0)))
+            t_evt = {"p": str(row.get("px", "0")), "q": str(row.get("sz", "0")), "m": False}
+            await trade_queue.put(t_evt)
 
 
 async def depth_handler_okx():
+    global latest_depth_evt
     url = "wss://ws.okx.com:8443/ws/v5/public"
     async with websockets.connect(url, ping_interval=20) as ws:
         await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "books5", "instId": symbol_resolved}]}))
@@ -164,81 +131,78 @@ async def depth_handler_okx():
                 continue
             bids = row.get("bids", [])
             asks = row.get("asks", [])
-            order_book["bids"] = {float(b[0]): float(b[1]) for b in bids}
-            order_book["asks"] = {float(a[0]): float(a[1]) for a in asks}
+            latest_depth_evt = {"b": [[b[0], b[1]] for b in bids], "a": [[a[0], a[1]] for a in asks]}
 
 
 async def training_loop():
     global scaler
-    train_steps = 0
-    future_prices = deque(maxlen=future_shift + 1)
-    features_list = []
+    steps = 0
+    warmup_feats = []
 
     print(f"📡 等待数据流开始... provider={provider} symbol={symbol_resolved}")
     while True:
-        await asyncio.sleep(0.1)
-        if not price_window or not order_book["bids"] or not order_book["asks"]:
+        trade_evt = await trade_queue.get()
+        seq = feature_builder.build(trade_evt, latest_depth_evt)
+        if seq is None:
             continue
 
-        price = price_window[-1]
-        future_prices.append(price)
+        # align dim
+        if seq.shape[1] > input_size:
+            seq = seq[:, :input_size]
+        elif seq.shape[1] < input_size:
+            pad = np.zeros((seq.shape[0], input_size - seq.shape[1]), dtype=np.float32)
+            seq = np.concatenate([seq, pad], axis=1)
 
-        features = extract_features(price_window, order_book)
-        if features is None:
-            continue
-
+        last_feat = seq[-1]
         if scaler is None:
-            features_buffer.append(features)
-            if len(features_buffer) >= 50:
+            warmup_feats.append(last_feat)
+            if len(warmup_feats) >= 100:
                 scaler = StandardScaler()
-                scaler.fit(np.array(features_buffer))
+                scaler.fit(np.array(warmup_feats, dtype=np.float32))
                 joblib.dump(scaler, scaler_path)
-                print(f"💾 已生成新的 scaler.pkl ({len(features_buffer)} 条特征)")
+                print(f"💾 已生成新的 scaler.pkl ({len(warmup_feats)} 条特征)")
+
         if scaler is not None:
-            features = scaler.transform(features.reshape(1, -1))[0]
+            seq = scaler.transform(seq)
 
-        features_list.append(features)
+        price = float(trade_evt.get("p", 0) or 0)
+        seq_buffer.append((seq.astype(np.float32), price))
 
-        if len(future_prices) > future_shift and len(features_list) > future_shift:
-            y = (future_prices[-1] - future_prices[0]) / max(future_prices[0], 1e-9)
-            labels_buffer.append(y)
-            features_buffer.append(features_list[-future_shift - 1])
+        if len(seq_buffer) > future_shift:
+            seq_old, p_old = seq_buffer[-future_shift - 1]
+            p_new = seq_buffer[-1][1]
+            y = (p_new - p_old) / max(p_old, 1e-9)
+            X_buffer.append(seq_old)
+            y_buffer.append(float(y))
 
-            if len(labels_buffer) >= batch_size:
-                tft_loss, nbeats_loss = train_batch(np.array(features_buffer[-batch_size:]), np.array(labels_buffer[-batch_size:]))
-                train_steps += 1
-                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                print(f"✅ {now_str} 训练 | Step: {train_steps} | TFT Loss: {tft_loss:.6f} | NBeats Loss: {nbeats_loss:.6f}")
-                tft_scheduler.step(tft_loss)
-                nbeats_scheduler.step(nbeats_loss)
-                features_buffer[:] = features_buffer[-batch_size:]
-                labels_buffer[:] = labels_buffer[-batch_size:]
-
-                if train_steps % save_interval == 0:
-                    torch.save(tft_model.state_dict(), "tft_model.pth")
-                    torch.save(nbeats_model.state_dict(), "nbeats_model.pth")
-                    print("💾 已保存模型")
+        if len(y_buffer) >= batch_size:
+            tft_loss, nbeats_loss = train_batch(np.array(X_buffer[-batch_size:]), np.array(y_buffer[-batch_size:]))
+            steps += 1
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"✅ {now} 训练 | Step: {steps} | TFT Loss: {tft_loss:.6f} | NBeats Loss: {nbeats_loss:.6f}")
+            if steps % save_interval == 0:
+                torch.save(tft_model.state_dict(), "tft_model.pth")
+                torch.save(nbeats_model.state_dict(), "nbeats_model.pth")
+                print("💾 已保存模型")
 
 
 async def status_monitor():
     while True:
-        if not price_window:
-            print("⏳ 等待成交数据...")
-        elif not order_book["bids"] or not order_book["asks"]:
-            print("⏳ 等待盘口数据...")
-        elif scaler is None and len(features_buffer) < 50:
-            print(f"📊 已收到特征 {len(features_buffer)}/50，等待生成 scaler.pkl...")
+        qn = trade_queue.qsize()
+        if latest_depth_evt is None:
+            print("⏳ 等待 books5 盘口数据...")
+        elif qn == 0:
+            print("⏳ 等待 trades 成交数据...")
         else:
-            print("✅ scaler.pkl 已生成，正在训练中...")
+            print(f"✅ 数据流正常，queue={qn}，已生成样本={len(y_buffer)}")
         await asyncio.sleep(3)
 
 
 async def main():
+    if provider != "okx":
+        raise SystemExit("当前训练脚本仅启用 okx provider")
     print(f"🚀 实时训练启动 provider={provider}")
-    if provider == "okx":
-        await asyncio.gather(trade_handler_okx(), depth_handler_okx(), training_loop(), status_monitor())
-    else:
-        await asyncio.gather(trade_handler_binance(), depth_handler_binance(), training_loop(), status_monitor())
+    await asyncio.gather(trade_handler_okx(), depth_handler_okx(), training_loop(), status_monitor())
 
 
 if __name__ == "__main__":

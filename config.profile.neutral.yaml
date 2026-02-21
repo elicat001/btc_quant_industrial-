@@ -1,0 +1,39 @@
+# 中性参数档：目标是减少极端 HOLD，但不过分激进
+market:
+  provider: okx
+  symbol_map:
+    btcusdt: BTC-USDT-SWAP
+
+symbols:
+  - btcusdt
+symbol: BTCUSDT
+seq_len: 30
+input_size: 12
+
+confirm:
+  need_prob: 0.53
+  max_gap_sec: 45
+
+gate:
+  min_dir_margin: 0.03
+  min_dir_margin_low_vol: 0.06
+
+low_vol:
+  bp: 0.00015
+  override_margin: 0.05
+  macd_gate: 0.20
+  rsi_lo: 32
+  rsi_hi: 68
+
+mm:
+  enable: true
+  min_spread: 0.00012
+  score_open: 0.62
+  score_force: 0.48
+  ml_margin: 0.05
+
+trading:
+  enabled: true
+  mode: paper
+  base_notional_usd: 100
+  leverage: 1
