@@ -6,10 +6,11 @@ import traceback
 from datetime import datetime
 from collections import deque
 import time
+import os
 import websockets
 
 # 现货公共流（也可切到 fstream，注意更改URI）
-BINANCE_WS_PRIMARY = "wss://stream.binance.com:9443/ws"
+BINANCE_WS_PRIMARY = os.getenv("BINANCE_WS_BASE", "wss://stream.binance.com:9443/ws")
 
 PING_INTERVAL = 10
 PING_TIMEOUT  = 5
@@ -214,6 +215,7 @@ class BinanceCollector:
         self._queue = asyncio.Queue()   # 合并后的数据队列
         self._cache = deque(maxlen=500) # 近500条缓存（新连接可快速回补）
         self._reconnect_delay = 1
+        self._max_reconnect_delay = int(os.getenv("WS_MAX_RECONNECT_DELAY", "60"))
 
         # 盘口状态（给 signal.fuse 用）
         self.ob_state = OrderBookState(k_levels=3, dt_window_ms=300)
@@ -236,6 +238,7 @@ class BinanceCollector:
                     max_queue=None
                 ) as ws:
                     logger.info(f"[{self.symbol}] {channel_name} WebSocket连接成功: {uri}")
+                    self._reconnect_delay = 1
                     async for msg in ws:
                         try:
                             data = json.loads(msg)
@@ -255,6 +258,12 @@ class BinanceCollector:
                             logger.error(f"[{self.symbol}] {channel_name} 消息处理异常: {e}")
                             traceback.print_exc()
             except Exception as e:
+                msg = str(e)
+                # 区域限制/风控拦截时，采用指数退避，避免日志风暴
+                if "451" in msg or "restricted location" in msg.lower():
+                    self._reconnect_delay = min(max(5, self._reconnect_delay * 2), self._max_reconnect_delay)
+                else:
+                    self._reconnect_delay = min(max(1, self._reconnect_delay + 1), self._max_reconnect_delay)
                 logger.warning(f"[{self.symbol}] {channel_name} WebSocket断开: {e}，将在{self._reconnect_delay}s后重连")
                 await asyncio.sleep(self._reconnect_delay)
 

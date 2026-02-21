@@ -104,7 +104,7 @@ SIM_CFG = CONFIG.get("sim", {}) or {
     "max_holding_min": 240
 }
 
-pusher = PushManager(CONFIG) if PUSH_ENABLED else None
+pusher = PushManager(config=CONFIG) if PUSH_ENABLED else None
 
 # ===== 全局缓存（给执行器/模拟器用） =====
 PRICE_CACHE: Dict[str, float] = {}     # symbol -> last trade price (float)
@@ -788,7 +788,8 @@ class SymbolRunner:
                     "p": float(price) if price is not None else None,
                     "close": list(self._closes) if len(self._closes) else None,
                     "p_hat_prob": float(prob),
-                    "p_min": getattr(self.sf, "p_min", 0.0)
+                    "p_min": getattr(self.sf, "p_min", 0.0),
+                    "reason_text": diag
                 }
                 decision, reason = self.risk.judge(fused_signal, trade_for_risk)
                 self.logger.info(f"[{self.symbol}] decision={decision} reason={reason}")

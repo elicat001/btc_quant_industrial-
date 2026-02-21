@@ -1,35 +1,67 @@
-# 新增配置文件：用于统一参数，避免硬编码。
+# Runtime-safe defaults (single symbol first, then scale out)
 symbols:
   - btcusdt
-  - ethusdt
-  - bnbusdt
-  - solusdt
-  - ltcusdt
-  - adausdt
-  - xrpusdt
-  - dogeusdt
-  - linkusdt
-  - avaxusdt
-  - op usdt
-  - arb usdt
-  - w usdt
-  - bchusdt
-  - uniusdt
-  - dotusdt
-  - maticusdt
-  - filusdt
-  - etcusdt
-  - atomusdt
-mode: run  # or train
+
+# Core
+mode: run
+seq_len: 30
+input_size: 12
+low_gpu_mode: true
+infer_cooldown_sec: 0.8
+min_push_interval_sec: 180
+push_enabled: false
+
+# Data / training helper params
 symbol: BTCUSDT
 interval: 1m
 lookback_hours: 48
 future_shift: 5
-input_size: 7
 batch_size: 32
 save_interval: 500
-thr_high: 0.6
-thr_low: 0.4
-take_profit: 0.02
-stop_loss: -0.01
-max_concurrent: 50
+
+# Confirmation / gate
+confirm:
+  need_prob: 0.62
+  max_gap_sec: 30
+
+gate:
+  min_dir_margin: 0.08
+  min_dir_margin_low_vol: 0.12
+
+# Trading (paper only by default)
+trading:
+  enabled: true
+  mode: paper
+  venue: futures
+  testnet: true
+  taker_fee_bp: 2.0
+  slippage_bp: 3.0
+  base_notional_usd: 100
+  leverage: 1
+  max_trades_per_hour: 4
+  max_daily_loss_bp: 120
+  symbol_map:
+    btcusdt: BTCUSDT
+
+# Keep swing module off in restricted regions (Binance REST 451)
+midtrend:
+  enable: false
+
+# Risk defaults
+risk:
+  cooldown_seconds: 90
+  reverse_guard_seconds: 240
+  tp_mult: 2.0
+  sl_mult: 1.6
+  tp_min: 0.003
+  sl_min: 0.002
+  future_holding: 120
+
+# Optional push config (fill before enabling push_enabled)
+push:
+  wecom:
+    mode: app
+    corp_id: ""
+    corp_secret: ""
+    agent_id: ""
+    to_user: "@all"
