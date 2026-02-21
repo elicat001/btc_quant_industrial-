@@ -307,6 +307,7 @@ class ModelManager:
                 wsum = sum(w)
                 w = [wi / wsum for wi in w]
                 p = float(np.dot(np.array(probs, dtype=float), np.array(w, dtype=float)) + self.blend_b)
+                p = float(np.clip(p, 1e-6, 1 - 1e-6))
 
             # 运行平均日志
             if self._ema is None:

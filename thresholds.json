@@ -1,0 +1,26 @@
+{
+  "temp": {
+    "tft": 1.05,
+    "nbt": 1.05
+  },
+  "smooth_alpha": 0.08,
+  "blend": {
+    "w": [
+      0.55,
+      0.45
+    ],
+    "b": 0.0
+  },
+  "runtime_thresholds": {
+    "buy": 0.56,
+    "sell": 0.44
+  },
+  "risk": {
+    "fee_bp": 0.0005,
+    "tp_mult": 1.8,
+    "sl_mult": 1.6,
+    "tp_min": 0.002,
+    "sl_min": 0.002,
+    "future_holding": 45
+  }
+}
