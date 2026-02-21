@@ -8,7 +8,7 @@ mode: run
 seq_len: 30
 input_size: 12
 low_gpu_mode: true
-infer_cooldown_sec: 0.8
+infer_cooldown_sec: 0.6
 min_push_interval_sec: 180
 push_enabled: false
 symbol: BTCUSDT
@@ -16,13 +16,13 @@ interval: 1m
 lookback_hours: 48
 future_shift: 5
 batch_size: 32
-save_interval: 10
+save_interval: 50
 confirm:
-  need_prob: 0.62
-  max_gap_sec: 30
+  need_prob: 0.55
+  max_gap_sec: 45
 gate:
-  min_dir_margin: 0.08
-  min_dir_margin_low_vol: 0.12
+  min_dir_margin: 0.04
+  min_dir_margin_low_vol: 0.08
 trading:
   enabled: true
   mode: paper
