@@ -48,20 +48,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tft_model = EnhancedTFT(input_size=input_size).to(device)
 nbeats_model = EnhancedNBeats(input_size=input_size).to(device)
 criterion = torch.nn.MSELoss()
-tft_optimizer = optim.Adam(tft_model.parameters(), lr=1e-4)
-nbeats_optimizer = optim.Adam(nbeats_model.parameters(), lr=1e-4)
+tft_optimizer = optim.Adam(tft_model.parameters(), lr=2e-5)
+nbeats_optimizer = optim.Adam(nbeats_model.parameters(), lr=2e-5)
 
 # shared state
 latest_depth_evt = None
 trade_queue = asyncio.Queue(maxsize=5000)
 feature_builder = FeatureBuilder(seq_len=seq_len, k_levels=3)
 scaler_path = "scaler.pkl"
-scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
-if scaler is not None:
-    n_in = getattr(scaler, "n_features_in_", None)
-    if n_in is not None and int(n_in) != int(input_size):
-        print(f"⚠️ scaler维度不匹配: {n_in} != {input_size}，将重建 scaler")
-        scaler = None
+# 训练阶段强制重建 scaler，避免历史坏缩放污染
+scaler = None
 
 
 # buffers
@@ -85,6 +81,7 @@ def train_batch(seqs, labels):
         tft_pred = tft_model(xb).squeeze(-1)
         tft_loss = criterion(tft_pred, yb)
         tft_loss.backward()
+        torch.nn.utils.clip_grad_norm_(tft_model.parameters(), max_norm=1.0)
         tft_optimizer.step()
 
         # NBeats keeps inference semantics: mean pooling over time
@@ -93,6 +90,7 @@ def train_batch(seqs, labels):
         nbeats_pred = nbeats_model(x_pool).squeeze(-1)
         nbeats_loss = criterion(nbeats_pred, yb)
         nbeats_loss.backward()
+        torch.nn.utils.clip_grad_norm_(nbeats_model.parameters(), max_norm=1.0)
         nbeats_optimizer.step()
 
         tft_loss_avg += float(tft_loss.item())
@@ -113,7 +111,10 @@ async def trade_handler_okx():
             row = (j.get("data") or [None])[0]
             if not row:
                 continue
-            t_evt = {"p": str(row.get("px", "0")), "q": str(row.get("sz", "0")), "m": False}
+            px = float(row.get("px", 0) or 0)
+            if px <= 0:
+                continue
+            t_evt = {"p": str(px), "q": str(row.get("sz", "0")), "m": False}
             await trade_queue.put(t_evt)
 
 
@@ -161,9 +162,11 @@ async def training_loop():
                 scaler.fit(np.array(warmup_feats, dtype=np.float32))
                 joblib.dump(scaler, scaler_path)
                 print(f"💾 已生成新的 scaler.pkl ({len(warmup_feats)} 条特征)")
+            else:
+                continue
 
-        if scaler is not None:
-            seq = scaler.transform(seq)
+        seq = scaler.transform(seq)
+        seq = np.clip(seq, -10.0, 10.0)
 
         price = float(trade_evt.get("p", 0) or 0)
         seq_buffer.append((seq.astype(np.float32), price))
@@ -171,9 +174,12 @@ async def training_loop():
         if len(seq_buffer) > future_shift:
             seq_old, p_old = seq_buffer[-future_shift - 1]
             p_new = seq_buffer[-1][1]
+            if p_old <= 0 or p_new <= 0:
+                continue
             y = (p_new - p_old) / max(p_old, 1e-9)
+            y = float(np.clip(y, -0.03, 0.03))
             X_buffer.append(seq_old)
-            y_buffer.append(float(y))
+            y_buffer.append(y)
 
         if len(y_buffer) >= batch_size:
             tft_loss, nbeats_loss = train_batch(np.array(X_buffer[-batch_size:]), np.array(y_buffer[-batch_size:]))

@@ -14,15 +14,17 @@ class EnhancedTFT(nn.Module):
         self.output = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
+        # x: (B,F) 或 (B,T,F)
         if x.ndim == 2:
-            x = x.unsqueeze(1)  # 添加序列维度 for attention
-        x = torch.relu(self.linear1(x))
-        x = x.permute(1, 0, -1)  # 为attention调整
-        x, _ = self.attention(x, x, x)
-        x = x.permute(1, 0, -1).squeeze(1)
-        x = torch.relu(self.linear2(x))
+            x = x.unsqueeze(1)
+        x = torch.relu(self.linear1(x))          # (B,T,H)
+        x = x.permute(1, 0, 2)                   # (T,B,H)
+        x, _ = self.attention(x, x, x)           # (T,B,H)
+        x = x.permute(1, 0, 2)                   # (B,T,H)
+        x = x[:, -1, :]                          # 取最后时刻 (B,H)
+        x = torch.relu(self.linear2(x))          # (B,H)
         x = self.dropout(x)
-        return self.output(x)
+        return self.output(x)                    # (B,1)
 
 class EnhancedNBeats(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=3, dropout=0.2):

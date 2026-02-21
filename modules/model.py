@@ -75,6 +75,7 @@ class _SimpleScaler:
 
 # ========= 无权重时的轻量回退模型 =========
 def _sigmoid(x):
+    x = np.clip(x, -50.0, 50.0)
     return 1.0 / (1.0 + np.exp(-x))
 
 class _FallbackModel:
