@@ -56,31 +56,47 @@ features_buffer = []
 labels_buffer = []
 scaler_path = "scaler.pkl"
 scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+if scaler is not None:
+    n_in = getattr(scaler, "n_features_in_", None)
+    if n_in is not None and int(n_in) != int(input_size):
+        print(f"⚠️ scaler维度不匹配: {n_in} != {input_size}，将重建 scaler")
+        scaler = None
 
 
 def extract_features(prices, ob):
     if len(prices) < 20 or not ob["bids"] or not ob["asks"]:
         return None
-    prices = np.array(prices)
+    prices = np.array(prices, dtype=np.float32)
     best_bid = max(ob["bids"].keys())
     best_ask = min(ob["asks"].keys())
-    spread = best_ask - best_bid
-    bid_depth = sum(ob["bids"].values())
-    ask_depth = sum(ob["asks"].values())
+    spread = float(best_ask - best_bid)
+    bid_depth = float(sum(ob["bids"].values()))
+    ask_depth = float(sum(ob["asks"].values()))
     imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-6)
-    return np.array([
-        prices[-1],
-        np.mean(prices[-5:]),
-        np.std(prices[-5:]),
-        prices[-1] - prices[-5],
-        (prices[-1] - np.mean(prices[-20:])) / (np.std(prices[-20:]) + 1e-6),
+
+    f = [
+        float(prices[-1]),
+        float(np.mean(prices[-5:])),
+        float(np.std(prices[-5:])),
+        float(prices[-1] - prices[-5]),
+        float((prices[-1] - np.mean(prices[-20:])) / (np.std(prices[-20:]) + 1e-6)),
         spread,
-        imbalance,
-    ], dtype=np.float32)
+        float(imbalance),
+        float(np.mean(prices[-20:])),
+        float(np.std(prices[-20:])),
+        float(prices[-1] - prices[-20]),
+        float(spread / max(prices[-1], 1e-6)),
+        float(np.log1p(bid_depth + ask_depth)),
+    ]
+    if len(f) < input_size:
+        f.extend([0.0] * (input_size - len(f)))
+    elif len(f) > input_size:
+        f = f[:input_size]
+    return np.array(f, dtype=np.float32)
 
 
 def train_batch(features, labels):
-    dataset = TensorDataset(torch.tensor(features).to(device), torch.tensor(labels).to(device))
+    dataset = TensorDataset(torch.tensor(features, dtype=torch.float32).to(device), torch.tensor(labels, dtype=torch.float32).to(device))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     tft_loss_avg = 0
     nbeats_loss_avg = 0

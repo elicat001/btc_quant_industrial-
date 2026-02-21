@@ -2,12 +2,8 @@ market:
   provider: okx
   symbol_map:
     btcusdt: BTC-USDT-SWAP
-
-# Runtime-safe defaults (single symbol first, then scale out)
 symbols:
-  - btcusdt
-
-# Core
+- btcusdt
 mode: run
 seq_len: 30
 input_size: 12
@@ -15,25 +11,18 @@ low_gpu_mode: true
 infer_cooldown_sec: 0.8
 min_push_interval_sec: 180
 push_enabled: false
-
-# Data / training helper params
 symbol: BTCUSDT
 interval: 1m
 lookback_hours: 48
 future_shift: 5
 batch_size: 32
-save_interval: 500
-
-# Confirmation / gate
+save_interval: 10
 confirm:
   need_prob: 0.62
   max_gap_sec: 30
-
 gate:
   min_dir_margin: 0.08
   min_dir_margin_low_vol: 0.12
-
-# Trading (paper only by default)
 trading:
   enabled: true
   mode: paper
@@ -47,12 +36,8 @@ trading:
   max_daily_loss_bp: 120
   symbol_map:
     btcusdt: BTCUSDT
-
-# Keep swing module off in restricted regions (Binance REST 451)
 midtrend:
   enable: false
-
-# Risk defaults
 risk:
   cooldown_seconds: 90
   reverse_guard_seconds: 240
@@ -61,12 +46,10 @@ risk:
   tp_min: 0.003
   sl_min: 0.002
   future_holding: 120
-
-# Optional push config (fill before enabling push_enabled)
 push:
   wecom:
     mode: app
-    corp_id: ""
-    corp_secret: ""
-    agent_id: ""
-    to_user: "@all"
+    corp_id: ''
+    corp_secret: ''
+    agent_id: ''
+    to_user: '@all'
