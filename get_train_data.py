@@ -1,62 +1,139 @@
-# File: get_train_data.py
-# 优化：添加分页拉取完整历史数据。统一特征为7维（加spread/imbalance近似）。使用ta-lib加速指标。添加标准化并保存scaler。从config加载参数。
-
 import pandas as pd
 import numpy as np
 import requests
 import time
 import joblib
 from sklearn.preprocessing import StandardScaler
-import talib  # 新增ta-lib
 import yaml
 
 with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
+    config = yaml.safe_load(f) or {}
+
+market = config.get("market", {}) or {}
+provider = str(market.get("provider", "okx")).lower()
 symbol = config.get("symbol", "BTCUSDT")
 interval = config.get("interval", "1m")
-lookback_hours = config.get("lookback_hours", 48)
+lookback_hours = int(config.get("lookback_hours", 48))
+symbol_map = market.get("symbol_map", {}) or {}
 
-def fetch_klines():
-    print("📥 正在从 Binance 获取历史K线数据...")
-    url = f"https://api.binance.com/api/v3/klines"
+
+def _ema(s: pd.Series, span: int = 14):
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def _rsi(s: pd.Series, period: int = 14):
+    d = s.diff()
+    up = d.clip(lower=0)
+    down = -d.clip(upper=0)
+    ru = up.ewm(alpha=1 / period, adjust=False).mean()
+    rd = down.ewm(alpha=1 / period, adjust=False).mean()
+    rs = ru / (rd + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+
+def _macd(s: pd.Series, fast: int = 12, slow: int = 26):
+    ef = s.ewm(span=fast, adjust=False).mean()
+    es = s.ewm(span=slow, adjust=False).mean()
+    return ef - es
+
+
+def fetch_klines_binance(sym: str):
+    print("📥 从 Binance 拉取历史K线...")
+    url = "https://api.binance.com/api/v3/klines"
     end_time = int(time.time() * 1000)
     start_time = end_time - lookback_hours * 60 * 60 * 1000
     data = []
     while start_time < end_time:
-        params = {"symbol": symbol, "interval": interval, "startTime": start_time, "endTime": end_time, "limit": 1000}
-        response = requests.get(url, params=params)
-        batch = response.json()
+        params = {"symbol": sym.upper(), "interval": interval, "startTime": start_time, "endTime": end_time, "limit": 1000}
+        batch = requests.get(url, params=params, timeout=15).json()
         if not batch:
             break
         data.extend(batch)
-        start_time = batch[-1][0] + 1
-    df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume", "close_time", "quote_asset_volume", "number_of_trades", "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"])
+        start_time = int(batch[-1][0]) + 1
+    df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tb_base", "tb_quote", "ignore"])
     df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+    for c in ["open", "high", "low", "close", "volume", "tb_base"]:
+        df[c] = df[c].astype(float)
     return df
 
-df = fetch_klines()
 
-# 添加技术指标 using ta-lib
-df["ema"] = talib.EMA(df["close"], timeperiod=14)
-df["rsi"] = talib.RSI(df["close"], timeperiod=14)
-df["macd"], _, _ = talib.MACD(df["close"], fastperiod=12, slowperiod=26, signalperiod=9)
+def fetch_klines_okx(inst_id: str):
+    print("📥 从 OKX 拉取历史K线...")
+    # docs: /api/v5/market/history-candles
+    bar_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H"}
+    bar = bar_map.get(interval, "1m")
+    url = "https://www.okx.com/api/v5/market/history-candles"
+    end_ts = int(time.time() * 1000)
+    start_ts = end_ts - lookback_hours * 60 * 60 * 1000
 
-# 近似spread/imbalance
+    rows = []
+    after = None
+    for _ in range(120):  # 防无限循环
+        params = {"instId": inst_id, "bar": bar, "limit": "100"}
+        if after is not None:
+            params["after"] = str(after)
+        r = requests.get(url, params=params, timeout=15).json()
+        data = (r or {}).get("data", [])
+        if not data:
+            break
+        # OKX data: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
+        rows.extend(data)
+        oldest = int(data[-1][0])
+        if oldest <= start_ts:
+            break
+        after = oldest
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume", "volCcy", "volCcyQuote", "confirm"])
+    df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="ms")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    # OKX 没有 taker_buy_base，用0占位
+    df["tb_base"] = 0.0
+    df = df.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
+    return df
+
+
+def resolve_symbol():
+    s = str(symbol)
+    if provider == "okx":
+        if s.lower() in symbol_map:
+            return str(symbol_map[s.lower()])
+        if s in symbol_map:
+            return str(symbol_map[s])
+        if s.lower().endswith("usdt"):
+            base = s[:-4].upper()
+            return f"{base}-USDT-SWAP"
+    return s.upper()
+
+
+resolved = resolve_symbol()
+if provider == "okx":
+    df = fetch_klines_okx(resolved)
+else:
+    df = fetch_klines_binance(resolved)
+
+if df.empty:
+    raise SystemExit("❌ 未拉取到K线数据")
+
+# 指标（纯 pandas，无 ta-lib 依赖）
+df["ema"] = _ema(df["close"], 14)
+df["rsi"] = _rsi(df["close"], 14)
+df["macd"] = _macd(df["close"], 12, 26)
+
+# 近似 spread / imbalance
 df["spread_approx"] = df["high"] - df["low"]
-df["imbalance_approx"] = (df["taker_buy_base_asset_volume"] - (df["volume"] - df["taker_buy_base_asset_volume"])) / (df["volume"] + 1e-6)
+df["imbalance_approx"] = (df["tb_base"] - (df["volume"] - df["tb_base"])) / (df["volume"] + 1e-6)
 
-# 创建未来收益率
-future_shift = config.get("future_shift", 5)
+future_shift = int(config.get("future_shift", 5))
 df["future_return"] = (df["close"].shift(-future_shift) - df["close"]) / df["close"]
 
-# 保留7维特征 + 标签
-train_df = df[["close", "volume", "rsi", "macd", "ema", "spread_approx", "imbalance_approx", "future_return"]].dropna()
+train_df = df[["close", "volume", "rsi", "macd", "ema", "spread_approx", "imbalance_approx", "future_return"]].dropna().copy()
 
-# 标准化并保存scaler
 scaler = StandardScaler()
 train_df.iloc[:, :-1] = scaler.fit_transform(train_df.iloc[:, :-1])
 joblib.dump(scaler, "scaler.pkl")
-
 train_df.to_csv("train_data.csv", index=False)
-print(f"✅ 已生成 train_data.csv, 共 {len(train_df)} 条数据")
+print(f"✅ 已生成 train_data.csv, 共 {len(train_df)} 条数据 | provider={provider} | symbol={resolved}")
