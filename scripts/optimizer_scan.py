@@ -42,9 +42,11 @@ def analyze(window_min=20):
             p = re.search(r"\bp=([0-9]*\.?[0-9]+)", ln)
             if p:
                 probs.append(float(p.group(1)))
-            for k in ["dir_margin", "p_min=", "low_vol=True", "mm_block"]:
-                if k in ln:
-                    blockers[k] += 1
+            # 仅统计明确阻塞项，避免把诊断字段误算成阻塞
+            if "mm_block(" in ln:
+                blockers["mm_block"] += 1
+            if "low_vol<" in ln:
+                blockers["low_vol_block"] += 1
 
     closes = 0
     pnl = 0.0
