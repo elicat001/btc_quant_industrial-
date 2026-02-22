@@ -12,6 +12,7 @@ LOG = ROOT / "logs" / "run.log"
 JOURNAL = ROOT / "logs" / "paper_trades.jsonl"
 CFG = ROOT / "config.yaml"
 THR = ROOT / "thresholds.json"
+STATE = ROOT / "optimizer_state.json"
 
 
 def ts_from_line(line: str):
@@ -79,6 +80,19 @@ def analyze(window_min=20):
     }
 
 
+def _load_state() -> dict:
+    if not STATE.exists():
+        return {}
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict):
+    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+
 def apply_tuning(stats: dict):
     cfg = yaml.safe_load(CFG.read_text()) or {}
     changed = []
@@ -93,6 +107,18 @@ def apply_tuning(stats: dict):
     MIN_PMIN_CAP = 0.54
     MIN_LOW_VOL_OVERRIDE = 0.009
 
+    # ===== 二阶优化：连续窗口确认（抗噪声） =====
+    # 条件：连续 3 个窗口同时满足“高阻塞 + HOLD 偏高”才允许进一步放松阈值
+    state = _load_state()
+    streak = int(state.get("relax_streak", 0))
+    relax_candidate = (
+        stats.get("hold_ratio", 100) > 60
+        and stats.get("blockers", {}).get("dir_margin", 0) > 200
+        and stats.get("blockers", {}).get("p_min=", 0) > 200
+    )
+    streak = streak + 1 if relax_candidate else 0
+    state["relax_streak"] = streak
+
     # 若当前已经低于安全边界，先拉回
     cur_pmin = float(cfg["strategy"].get("pmin_cap", 0.58))
     if cur_pmin < MIN_PMIN_CAP:
@@ -106,25 +132,26 @@ def apply_tuning(stats: dict):
 
     # 质量门：当模型均值仍接近 0.5 时，禁止继续放松阈值
     weak_signal = abs(float(stats.get("avg_prob", 0.5)) - 0.5) < 0.004
+    allow_relax = (not weak_signal) and (streak >= 3)
 
     # bounded micro-tuning rules
-    if stats["hold_ratio"] > 75 and stats["blockers"].get("dir_margin", 0) > 200 and not weak_signal:
+    if stats["hold_ratio"] > 75 and stats["blockers"].get("dir_margin", 0) > 200 and allow_relax:
         old = float(cfg["gate"].get("min_dir_margin", 0.01))
-        new = max(0.0, old - 0.002)
+        new = max(0.0, old - 0.001)  # 单次限幅，避免激进
         if new != old:
             cfg["gate"]["min_dir_margin"] = new
             changed.append(f"gate.min_dir_margin {old:.4f}->{new:.4f}")
 
-    if stats["blockers"].get("p_min=", 0) > 200 and not weak_signal:
+    if stats["blockers"].get("p_min=", 0) > 200 and allow_relax:
         old = float(cfg["strategy"].get("pmin_cap", 0.58))
-        new = max(MIN_PMIN_CAP, old - 0.01)
+        new = max(MIN_PMIN_CAP, old - 0.005)  # 单次限幅，避免激进
         if new != old:
             cfg["strategy"]["pmin_cap"] = new
             changed.append(f"strategy.pmin_cap {old:.3f}->{new:.3f}")
 
-    if stats["blockers"].get("low_vol=True", 0) > 200 and not weak_signal:
+    if stats["blockers"].get("low_vol=True", 0) > 200 and allow_relax:
         old = float(cfg["low_vol"].get("override_margin", 0.015))
-        new = max(MIN_LOW_VOL_OVERRIDE, old - 0.002)
+        new = max(MIN_LOW_VOL_OVERRIDE, old - 0.001)  # 单次限幅，避免激进
         if new != old:
             cfg["low_vol"]["override_margin"] = new
             changed.append(f"low_vol.override_margin {old:.3f}->{new:.3f}")
@@ -140,6 +167,7 @@ def apply_tuning(stats: dict):
     if changed:
         CFG.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
 
+    _save_state(state)
     return changed
 
 
@@ -156,8 +184,10 @@ def main():
     if args.apply:
         changed = apply_tuning(stats)
 
+    st = _load_state()
     out = {
         "stats": stats,
+        "state": {"relax_streak": int(st.get("relax_streak", 0))},
         "changed": changed,
         "action": "restart_required" if changed else "no_change",
     }
