@@ -1,6 +1,8 @@
 # modules/executor.py
 import time
 import threading
+import json
+from pathlib import Path
 from collections import deque, defaultdict
 
 __all__ = ["TradeExecutor", "PaperBroker"]
@@ -13,13 +15,15 @@ class PaperBroker:
     - 否则退化为用 last price 并叠加滑点基点（可自适应 spread）
     - 维护持仓/权益/当日回撤
     """
-    def __init__(self):
+    def __init__(self, journal_path: str = "logs/paper_trades.jsonl"):
         self.position = defaultdict(lambda: {"side": "FLAT", "qty": 0.0, "entry": 0.0})
         self.equity = 100000.0
         self.daily_eq_hi = self.equity
         self.daily_eq_lo = self.equity
         self.trades = []
         self.day = time.strftime("%Y-%m-%d")
+        self.journal_path = Path(journal_path)
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _roll_day(self):
         d = time.strftime("%Y-%m-%d")
@@ -47,6 +51,13 @@ class PaperBroker:
         self.daily_eq_hi = max(self.daily_eq_hi, self.equity)
         self.daily_eq_lo = min(self.daily_eq_lo, self.equity)
 
+    def _append_journal(self, rec: dict):
+        try:
+            with self.journal_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def _fill_price_with_slippage(self, side: str, last_px: float,
                                   best_bid: float, best_ask: float,
                                   slippage_bp: float):
@@ -63,22 +74,22 @@ class PaperBroker:
 
     def place(self, sym: str, side: str, last_px: float, notional_quote: float,
               best_bid: float = None, best_ask: float = None, reduce_only: bool = False,
-              slippage_bp: float = 5.0):
-        """
-        返回 {status, price, qty, equity}
-        - notional_quote 以 USD 计价：按市价折算数量
-        """
+              slippage_bp: float = 5.0, reason: str = ""):
+        """返回 {status, price, qty, equity, event, pnl?}"""
         self._roll_day()
+        ts = time.time()
         px = float(self._fill_price_with_slippage(side, last_px, best_bid, best_ask, slippage_bp))
         if px <= 0:
             return {"status": "ERR", "info": "bad_price"}
 
-        qty = max(0.0001, notional_quote / px)  # 简单折算
+        qty = max(0.0001, notional_quote / px)
         pos = self.position[sym]
+        event = "OPEN"
+        pnl = 0.0
 
         if side == "BUY":
             if pos["side"] == "SHORT" and reduce_only:
-                # 平空
+                event = "CLOSE_SHORT"
                 close_qty = min(pos["qty"], qty)
                 pnl = (pos["entry"] - px) * close_qty
                 self.equity += pnl
@@ -86,14 +97,14 @@ class PaperBroker:
                 if pos["qty"] <= 1e-10:
                     pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0})
             else:
-                # 开多/加多（简单覆盖均价）
                 pos["side"] = "LONG"
                 pos["qty"] = qty
                 pos["entry"] = px
+                event = "OPEN_LONG"
 
         elif side == "SELL":
             if pos["side"] == "LONG" and reduce_only:
-                # 平多
+                event = "CLOSE_LONG"
                 close_qty = min(pos["qty"], qty)
                 pnl = (px - pos["entry"]) * close_qty
                 self.equity += pnl
@@ -101,14 +112,28 @@ class PaperBroker:
                 if pos["qty"] <= 1e-10:
                     pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0})
             else:
-                # 开空/加空
                 pos["side"] = "SHORT"
                 pos["qty"] = qty
                 pos["entry"] = px
+                event = "OPEN_SHORT"
 
-        self.trades.append((time.time(), sym, side, qty, px))
+        rec = {
+            "ts": ts,
+            "symbol": sym,
+            "side": side,
+            "event": event,
+            "qty": qty,
+            "price": px,
+            "pnl": float(pnl),
+            "equity": float(self.equity),
+            "reduce_only": bool(reduce_only),
+            "reason": reason,
+        }
+        self._append_journal(rec)
+
+        self.trades.append((ts, sym, side, qty, px, event, pnl))
         self._update_daily_extrema()
-        return {"status": "FILLED", "price": px, "qty": qty, "equity": self.equity}
+        return {"status": "FILLED", "price": px, "qty": qty, "equity": self.equity, "event": event, "pnl": float(pnl)}
 
 
 class TradeExecutor:
@@ -234,7 +259,8 @@ class TradeExecutor:
                     mapped, decision, last_px, notional,
                     best_bid=best_bid, best_ask=best_ask,
                     reduce_only=reduce_only,
-                    slippage_bp=dynamic_slip_bp
+                    slippage_bp=dynamic_slip_bp,
+                    reason=reason
                 )
                 if resp.get("status") == "FILLED":
                     self._bump_rate(sym)
