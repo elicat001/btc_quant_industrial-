@@ -104,7 +104,9 @@ SIM_CFG = CONFIG.get("sim", {}) or {
     "max_holding_min": 240
 }
 
-pusher = PushManager(config=CONFIG) if PUSH_ENABLED else None
+# 仅把 wecom 子配置传给 PushManager，避免误把根级 mode=run 当成推送 mode
+PUSH_WECOM_CFG = ((CONFIG.get("push") or {}).get("wecom") or {})
+pusher = PushManager(config=PUSH_WECOM_CFG) if PUSH_ENABLED else None
 
 # ===== 全局缓存（给执行器/模拟器用） =====
 PRICE_CACHE: Dict[str, float] = {}     # symbol -> last trade price (float)

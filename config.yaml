@@ -10,7 +10,7 @@ input_size: 12
 low_gpu_mode: true
 infer_cooldown_sec: 0.6
 min_push_interval_sec: 180
-push_enabled: false
+push_enabled: true
 symbol: BTCUSDT
 interval: 1m
 lookback_hours: 48
@@ -49,13 +49,13 @@ risk:
 push:
   wecom:
     mode: app
-    corp_id: ''
-    corp_secret: ''
-    agent_id: ''
+    corp_id: 'ww48e7997569d8a748'
+    corp_secret: 'nloxl-4l7b2beqht9P2V65gX4MxsgjMruvoo3K_07PM'
+    agent_id: '1000004'
     to_user: '@all'
 low_vol:
   bp: 0.0001
-  override_margin: 0.011
+  override_margin: 0.005
   macd_gate: 0.08
   rsi_lo: 30
   rsi_hi: 70
@@ -75,4 +75,4 @@ mm:
     add_multi: 1.5
 strategy:
   pmin_low_vol_floor: 0.5
-  pmin_cap: 0.5599999999999999
+  pmin_cap: 0.5299999999999999
