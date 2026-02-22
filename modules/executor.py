@@ -250,7 +250,7 @@ class TradeExecutor:
                 notional = self.base_notional * float(self.leverage)
 
             # reduce_only：风控给出的平仓类原因
-            reduce_only_reasons = {"take_profit", "stop_loss", "trail_take", "timeout", "breakeven"}
+            reduce_only_reasons = {"take_profit", "stop_loss", "trail_take", "timeout", "breakeven", "fast_take"}
             reduce_only = self.reduce_only_on_exit and (reason in reduce_only_reasons)
 
             # === 执行 ===

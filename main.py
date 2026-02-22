@@ -768,10 +768,33 @@ class SymbolRunner:
                     "score_force_low_vol": mm_cfg.get("score_force_low_vol", mm_cfg.get("score_force", 0.52)),
                 })
 
-                # 如果门控拒绝，直接降级为 HOLD@filtered（不再误导）
+                # 如果门控拒绝：不开新仓，但已持仓时仍允许风控检查平仓（TP/SL/超时等）
                 if gate_reject:
                     if prob is None:
                         continue
+
+                    # 若当前已有仓位，优先让风险模块做持仓管理，避免“只开不平”
+                    in_pos = getattr(self.risk, "position", "HOLD") in ("BUY", "SELL")
+                    if in_pos:
+                        trade_for_risk = {
+                            "symbol": self.symbol,
+                            "p": float(price) if price is not None else None,
+                            "close": list(self._closes) if len(self._closes) else None,
+                            "p_hat_prob": float(prob),
+                            "p_min": getattr(self.sf, "p_min", 0.0),
+                            "reason_text": diag
+                        }
+                        decision, reason = self.risk.judge("HOLD", trade_for_risk)
+                        self.logger.info(f"[{self.symbol}] gate_reject risk_check decision={decision} reason={reason}")
+                        if decision in ("BUY", "SELL"):
+                            await self._maybe_push(decision, trade_for_risk, prob,
+                                                   hint=diag, fused_signal=fused_signal, reason=reason,
+                                                   env_str=env_str, model_line=model_line)
+                            if self.executor:
+                                exec_resp = self.executor.execute(self.symbol, decision, reason)
+                                self.logger.info(f"[{self.symbol}] EXEC {exec_resp}")
+                            continue
+
                     await self._maybe_push("HOLD@filtered", {
                         "p": float(price) if price is not None else None
                     }, prob, fused_signal=fused_signal, reason="filtered", env_str=env_str, model_line=model_line)
