@@ -89,24 +89,42 @@ def apply_tuning(stats: dict):
     cfg.setdefault("low_vol", {})
     cfg.setdefault("strategy", {})
 
+    # ===== 实盘优先的保守边界（防止自动优化一路下压） =====
+    MIN_PMIN_CAP = 0.54
+    MIN_LOW_VOL_OVERRIDE = 0.009
+
+    # 若当前已经低于安全边界，先拉回
+    cur_pmin = float(cfg["strategy"].get("pmin_cap", 0.58))
+    if cur_pmin < MIN_PMIN_CAP:
+        cfg["strategy"]["pmin_cap"] = MIN_PMIN_CAP
+        changed.append(f"strategy.pmin_cap {cur_pmin:.3f}->{MIN_PMIN_CAP:.3f} (rebound)")
+
+    cur_lvo = float(cfg["low_vol"].get("override_margin", 0.015))
+    if cur_lvo < MIN_LOW_VOL_OVERRIDE:
+        cfg["low_vol"]["override_margin"] = MIN_LOW_VOL_OVERRIDE
+        changed.append(f"low_vol.override_margin {cur_lvo:.3f}->{MIN_LOW_VOL_OVERRIDE:.3f} (rebound)")
+
+    # 质量门：当模型均值仍接近 0.5 时，禁止继续放松阈值
+    weak_signal = abs(float(stats.get("avg_prob", 0.5)) - 0.5) < 0.004
+
     # bounded micro-tuning rules
-    if stats["hold_ratio"] > 75 and stats["blockers"].get("dir_margin", 0) > 200:
+    if stats["hold_ratio"] > 75 and stats["blockers"].get("dir_margin", 0) > 200 and not weak_signal:
         old = float(cfg["gate"].get("min_dir_margin", 0.01))
         new = max(0.0, old - 0.002)
         if new != old:
             cfg["gate"]["min_dir_margin"] = new
             changed.append(f"gate.min_dir_margin {old:.4f}->{new:.4f}")
 
-    if stats["blockers"].get("p_min=", 0) > 200:
+    if stats["blockers"].get("p_min=", 0) > 200 and not weak_signal:
         old = float(cfg["strategy"].get("pmin_cap", 0.58))
-        new = max(0.52, old - 0.01)
+        new = max(MIN_PMIN_CAP, old - 0.01)
         if new != old:
             cfg["strategy"]["pmin_cap"] = new
             changed.append(f"strategy.pmin_cap {old:.3f}->{new:.3f}")
 
-    if stats["blockers"].get("low_vol=True", 0) > 200:
+    if stats["blockers"].get("low_vol=True", 0) > 200 and not weak_signal:
         old = float(cfg["low_vol"].get("override_margin", 0.015))
-        new = max(0.005, old - 0.002)
+        new = max(MIN_LOW_VOL_OVERRIDE, old - 0.002)
         if new != old:
             cfg["low_vol"]["override_margin"] = new
             changed.append(f"low_vol.override_margin {old:.3f}->{new:.3f}")
