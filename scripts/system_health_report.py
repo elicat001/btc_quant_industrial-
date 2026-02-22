@@ -63,9 +63,11 @@ def main():
     closes = [r for r in rows if str(r.get("event", "")).startswith("CLOSE")]
     opens = [r for r in rows if str(r.get("event", "")).startswith("OPEN")]
 
-    pnl_total = sum(float(r.get("pnl", 0.0)) for r in closes)
-    wins = sum(1 for r in closes if float(r.get("pnl", 0.0)) > 0)
-    losses = sum(1 for r in closes if float(r.get("pnl", 0.0)) < 0)
+    pnl_total = sum(float(r.get("pnl_net", r.get("pnl", 0.0))) for r in closes)
+    pnl_gross_total = sum(float(r.get("pnl_gross", r.get("pnl", 0.0))) for r in closes)
+    fee_total = sum(float(r.get("fee_total", 0.0)) for r in closes)
+    wins = sum(1 for r in closes if float(r.get("pnl_net", r.get("pnl", 0.0))) > 0)
+    losses = sum(1 for r in closes if float(r.get("pnl_net", r.get("pnl", 0.0))) < 0)
     win_rate = (wins / max(1, wins + losses)) * 100
 
     close_reason = Counter(str(r.get("reason", "")) for r in closes)
@@ -78,7 +80,8 @@ def main():
     print(f"- 信号: BUY/SELL/HOLD = {sig['BUY']}/{sig['SELL']}/{sig['HOLD']} (active {active_ratio:.1f}%)")
     print(f"- 平均prob: {avg_prob:.3f}")
     print(f"- 订单: OPEN={len(opens)} CLOSE={len(closes)}")
-    print(f"- 已平仓PnL: {pnl_total:.2f} USD")
+    print(f"- 已平仓PnL(net): {pnl_total:.2f} USD")
+    print(f"- 已平仓PnL(gross): {pnl_gross_total:.2f} USD | fee: {fee_total:.2f} USD")
     print(f"- 胜率: {win_rate:.1f}% (win={wins}, loss={losses})")
     if close_reason:
         top = ", ".join([f"{k}:{v}" for k, v in close_reason.most_common(5)])

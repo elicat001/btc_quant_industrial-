@@ -16,7 +16,7 @@ class PaperBroker:
     - 维护持仓/权益/当日回撤
     """
     def __init__(self, journal_path: str = "logs/paper_trades.jsonl"):
-        self.position = defaultdict(lambda: {"side": "FLAT", "qty": 0.0, "entry": 0.0})
+        self.position = defaultdict(lambda: {"side": "FLAT", "qty": 0.0, "entry": 0.0, "entry_fee": 0.0})
         self.equity = 100000.0
         self.daily_eq_hi = self.equity
         self.daily_eq_lo = self.equity
@@ -74,8 +74,8 @@ class PaperBroker:
 
     def place(self, sym: str, side: str, last_px: float, notional_quote: float,
               best_bid: float = None, best_ask: float = None, reduce_only: bool = False,
-              slippage_bp: float = 5.0, reason: str = ""):
-        """返回 {status, price, qty, equity, event, pnl?}"""
+              slippage_bp: float = 5.0, taker_fee_bp: float = 0.0, reason: str = ""):
+        """返回 {status, price, qty, equity, event, pnl?}；pnl 为净值(含手续费)"""
         self._roll_day()
         ts = time.time()
         px = float(self._fill_price_with_slippage(side, last_px, best_bid, best_ask, slippage_bp))
@@ -86,35 +86,53 @@ class PaperBroker:
         pos = self.position[sym]
         event = "OPEN"
         pnl = 0.0
+        pnl_gross = 0.0
+        fee_open = 0.0
+        fee_close = 0.0
 
         if side == "BUY":
             if pos["side"] == "SHORT" and reduce_only:
                 event = "CLOSE_SHORT"
                 close_qty = min(pos["qty"], qty)
-                pnl = (pos["entry"] - px) * close_qty
-                self.equity += pnl
+                pnl_gross = (pos["entry"] - px) * close_qty
+                fee_close = px * close_qty * (taker_fee_bp / 10000.0)
+                fee_open = float(pos.get("entry_fee", 0.0))
+                pnl = pnl_gross - fee_open - fee_close
+                # equity: 开仓手续费已在开仓时扣除，此处只加 gross-close_fee
+                self.equity += (pnl_gross - fee_close)
                 pos["qty"] -= close_qty
                 if pos["qty"] <= 1e-10:
-                    pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0})
+                    pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0, "entry_fee": 0.0})
             else:
                 pos["side"] = "LONG"
                 pos["qty"] = qty
                 pos["entry"] = px
+                fee_open = px * qty * (taker_fee_bp / 10000.0)
+                pos["entry_fee"] = fee_open
+                self.equity -= fee_open
+                pnl = -fee_open
                 event = "OPEN_LONG"
 
         elif side == "SELL":
             if pos["side"] == "LONG" and reduce_only:
                 event = "CLOSE_LONG"
                 close_qty = min(pos["qty"], qty)
-                pnl = (px - pos["entry"]) * close_qty
-                self.equity += pnl
+                pnl_gross = (px - pos["entry"]) * close_qty
+                fee_close = px * close_qty * (taker_fee_bp / 10000.0)
+                fee_open = float(pos.get("entry_fee", 0.0))
+                pnl = pnl_gross - fee_open - fee_close
+                self.equity += (pnl_gross - fee_close)
                 pos["qty"] -= close_qty
                 if pos["qty"] <= 1e-10:
-                    pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0})
+                    pos.update({"side": "FLAT", "qty": 0.0, "entry": 0.0, "entry_fee": 0.0})
             else:
                 pos["side"] = "SHORT"
                 pos["qty"] = qty
                 pos["entry"] = px
+                fee_open = px * qty * (taker_fee_bp / 10000.0)
+                pos["entry_fee"] = fee_open
+                self.equity -= fee_open
+                pnl = -fee_open
                 event = "OPEN_SHORT"
 
         rec = {
@@ -125,6 +143,11 @@ class PaperBroker:
             "qty": qty,
             "price": px,
             "pnl": float(pnl),
+            "pnl_net": float(pnl),
+            "pnl_gross": float(pnl_gross),
+            "fee_open": float(fee_open),
+            "fee_close": float(fee_close),
+            "fee_total": float(fee_open + fee_close),
             "equity": float(self.equity),
             "reduce_only": bool(reduce_only),
             "reason": reason,
@@ -157,6 +180,7 @@ class TradeExecutor:
         self.reduce_only_on_exit = bool(tcfg.get("reduce_only_on_exit", True))
         self.max_trades_per_hour = int(tcfg.get("max_trades_per_hour", 6))
         self.max_daily_loss_bp = float(tcfg.get("max_daily_loss_bp", 150))
+        self.taker_fee_bp = float(tcfg.get("taker_fee_bp", 0.0))
         self.slippage_bp = float(tcfg.get("slippage_bp", 5))
         self.order_type = str(tcfg.get("order_type", "MARKET")).upper()
         self.testnet = bool(tcfg.get("testnet", True))
@@ -260,6 +284,7 @@ class TradeExecutor:
                     best_bid=best_bid, best_ask=best_ask,
                     reduce_only=reduce_only,
                     slippage_bp=dynamic_slip_bp,
+                    taker_fee_bp=self.taker_fee_bp,
                     reason=reason
                 )
                 if resp.get("status") == "FILLED":
