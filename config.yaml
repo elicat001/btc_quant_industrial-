@@ -18,7 +18,7 @@ future_shift: 5
 batch_size: 32
 save_interval: 50
 confirm:
-  need_prob: 0.49
+  need_prob: 0.5
   max_gap_sec: 90
 gate:
   min_dir_margin: 0.005
@@ -32,20 +32,25 @@ trading:
   slippage_bp: 3.0
   base_notional_usd: 100
   leverage: 1
-  max_trades_per_hour: 20
+  max_trades_per_hour: 12
   max_daily_loss_bp: 150
   symbol_map:
     btcusdt: BTCUSDT
 midtrend:
   enable: false
 risk:
-  cooldown_seconds: 90
-  reverse_guard_seconds: 240
-  tp_mult: 2.0
-  sl_mult: 1.6
-  tp_min: 0.0026
+  cooldown_seconds: 120
+  reverse_guard_seconds: 300
+  tp_mult: 2.4
+  sl_mult: 1.5
+  tp_min: 0.0032
   sl_min: 0.0018
-  future_holding: 45
+  future_holding: 55
+  breakeven_ratio: 0.75
+  fast_take:
+    enable: true
+    tp_mult: 2.8
+    window_min: 8
 push:
   wecom:
     mode: app
@@ -55,7 +60,7 @@ push:
     to_user: '@all'
 low_vol:
   bp: 0.0001
-  override_margin: 0.009
+  override_margin: 0.011
   macd_gate: 0.08
   rsi_lo: 30
   rsi_hi: 70
@@ -64,8 +69,8 @@ mm:
   gate_mode: relaxed
   min_spread: 0.0001
   imb_th: 0.1
-  score_open: 0.22
-  score_force: 0.18
+  score_open: 0.24
+  score_force: 0.19
   ml_margin: 0.0
   cooldown_s: 12
   k_levels: 3
@@ -75,4 +80,4 @@ mm:
     add_multi: 1.5
 strategy:
   pmin_low_vol_floor: 0.5
-  pmin_cap: 0.54
+  pmin_cap: 0.56

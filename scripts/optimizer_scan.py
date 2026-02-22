@@ -48,6 +48,10 @@ def analyze(window_min=20):
 
     closes = 0
     pnl = 0.0
+    wins = 0
+    losses = 0
+    win_sum = 0.0
+    loss_sum = 0.0
     if JOURNAL.exists():
         for ln in JOURNAL.read_text(errors="ignore").splitlines()[-200000:]:
             try:
@@ -57,7 +61,14 @@ def analyze(window_min=20):
                     continue
                 if str(j.get("event", "")).startswith("CLOSE"):
                     closes += 1
-                    pnl += float(j.get("pnl", 0.0))
+                    p0 = float(j.get("pnl", 0.0))
+                    pnl += p0
+                    if p0 > 0:
+                        wins += 1
+                        win_sum += p0
+                    elif p0 < 0:
+                        losses += 1
+                        loss_sum += abs(p0)
             except Exception:
                 continue
 
@@ -66,6 +77,11 @@ def analyze(window_min=20):
     hold_ratio = (sig["HOLD"] / total * 100) if total else 100.0
     active_ratio = (active / total * 100) if total else 0.0
     avg_prob = sum(probs) / len(probs) if probs else 0.5
+
+    win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) else 0.0
+    avg_win = (win_sum / wins) if wins else 0.0
+    avg_loss = (loss_sum / losses) if losses else 0.0
+    rr = (avg_win / avg_loss) if avg_loss > 0 else (999.0 if avg_win > 0 else 0.0)
 
     return {
         "window_min": window_min,
@@ -77,6 +93,12 @@ def analyze(window_min=20):
         "blockers": dict(blockers),
         "closes": closes,
         "pnl": pnl,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "rr": rr,
     }
 
 
@@ -132,7 +154,9 @@ def apply_tuning(stats: dict):
 
     # 质量门：当模型均值仍接近 0.5 时，禁止继续放松阈值
     weak_signal = abs(float(stats.get("avg_prob", 0.5)) - 0.5) < 0.004
-    allow_relax = (not weak_signal) and (streak >= 3)
+    # 业绩门：目标是高胜率(>=90%) + 较好盈亏比(>=1.3)，未达标时只允许收紧，不允许放松
+    perf_ok = (stats.get("win_rate", 0.0) >= 90.0) and (stats.get("rr", 0.0) >= 1.3)
+    allow_relax = (not weak_signal) and (streak >= 3) and perf_ok
 
     # bounded micro-tuning rules
     if stats["hold_ratio"] > 75 and stats["blockers"].get("dir_margin", 0) > 200 and allow_relax:
@@ -163,6 +187,20 @@ def apply_tuning(stats: dict):
         if new != old:
             cfg["mm"]["cooldown_s"] = new
             changed.append(f"mm.cooldown_s {old}->{new}")
+
+    # 当业绩未达目标时，优先“收紧质量”，而不是盲目放松
+    if not perf_ok:
+        old = float(cfg["strategy"].get("pmin_cap", 0.56))
+        new = min(0.58, old + 0.005)
+        if new != old:
+            cfg["strategy"]["pmin_cap"] = new
+            changed.append(f"strategy.pmin_cap {old:.3f}->{new:.3f} (tighten)")
+
+        old2 = float(cfg["low_vol"].get("override_margin", 0.011))
+        new2 = min(0.015, old2 + 0.001)
+        if new2 != old2:
+            cfg["low_vol"]["override_margin"] = new2
+            changed.append(f"low_vol.override_margin {old2:.3f}->{new2:.3f} (tighten)")
 
     if changed:
         CFG.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
@@ -201,6 +239,7 @@ def main():
     print(f"- HOLD占比: {stats['hold_ratio']:.1f}% | active: {stats['active_ratio']:.1f}% | avg_prob: {stats['avg_prob']:.3f}")
     print(f"- blockers: {stats['blockers']}")
     print(f"- 平仓数: {stats['closes']} | PnL: {stats['pnl']:.4f}")
+    print(f"- 胜率: {stats['win_rate']:.1f}% (w={stats['wins']}, l={stats['losses']}) | RR: {stats['rr']:.2f}")
     if changed:
         print("- 已自动微调:")
         for c in changed:
